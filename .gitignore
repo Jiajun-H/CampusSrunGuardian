@@ -1,0 +1,10 @@
+/bin/
+/dist/
+*.log
+*.tmp
+*.new
+*.exe
+*.pdb
+credentials.dat
+credentials.bin
+campus-ssid.txt
