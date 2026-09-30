@@ -45,6 +45,7 @@ internal static class CampusSrunGuardian
     {
         try
         {
+            Console.OutputEncoding = new UTF8Encoding(false);
             string command = args.Length == 0 ? "--help" : args[0].ToLowerInvariant();
             if (command == "--configure")
             {
@@ -60,6 +61,8 @@ internal static class CampusSrunGuardian
                 return PrintStatus();
             if (command == "--prepare-login")
                 return PrepareLogin();
+            if (command == "--diagnose")
+                return DiagnoseLoginConfiguration();
             if (command == "--once")
                 return RunOnce();
             if (command == "--run")
@@ -103,10 +106,11 @@ internal static class CampusSrunGuardian
 
     private static void PrintHelp()
     {
-        Console.WriteLine("Campus SRun Guardian");
+        Console.WriteLine("Campus SRun Guardian " + AppMetadata.Version);
         Console.WriteLine("  --configure  Securely save credentials (run locally as Administrator).");
         Console.WriteLine("  --status     Check current SRun status; does not authenticate.");
         Console.WriteLine("  --prepare-login Fetch a challenge and prepare fields; does not submit login.");
+        Console.WriteLine("  --diagnose   Compare saved account with the current session and read portal diagnostics; does not authenticate.");
         Console.WriteLine("  --once       Check status and authenticate only if offline.");
         Console.WriteLine("  --run        Run the background monitor.");
     }
@@ -160,13 +164,29 @@ internal static class CampusSrunGuardian
         HardenDirectory(DataDirectory);
         if (File.Exists(LogPath))
             ApplyFileAcl(LogPath);
-        SaveCredentials(new Credentials
+        Credentials previous = null;
+        if (File.Exists(CredentialPath))
+        {
+            try { previous = LoadCredentials(); }
+            catch (Exception) { }
+        }
+        var configured = new Credentials
         {
             Username = username.Trim(),
             Password = password,
             UserType = (userType ?? "").Trim().TrimStart('@')
-        });
+        };
+        SaveCredentials(configured);
         Log("configure", "Encrypted credentials saved.");
+        if (previous != null)
+        {
+            Console.WriteLine(String.Equals(GetLoginUsername(previous), GetLoginUsername(configured), StringComparison.Ordinal)
+                ? "The account entered matches the previously saved account."
+                : "The account entered differs from the previously saved account.");
+            Console.WriteLine(String.Equals(previous.Password, configured.Password, StringComparison.Ordinal)
+                ? "The password entered matches the previously saved password."
+                : "The password entered differs from the previously saved password.");
+        }
     }
 
     private static string ReadHidden()
@@ -278,6 +298,101 @@ internal static class CampusSrunGuardian
         }
     }
 
+    private static string GetLoginUsername(Credentials credentials)
+    {
+        return credentials.Username + (String.IsNullOrEmpty(credentials.UserType) ? "" : "@" + credentials.UserType);
+    }
+
+    private static string CompareAccountWithSession(Credentials credentials, IDictionary<string, object> status)
+    {
+        // This campus reports an internal authentication realm in "domain" even
+        // when its login page sends a bare account. Do not invent a login suffix.
+        string reported = GetString(status, "user_name").Trim();
+        if (String.IsNullOrEmpty(reported)) return "unavailable";
+        string configured = GetLoginUsername(credentials);
+        if (String.Equals(configured, reported, StringComparison.Ordinal)) return "match";
+        int suffixStart = configured.IndexOf('@');
+        if (suffixStart > 0 && reported.IndexOf('@') < 0 &&
+            String.Equals(configured.Substring(0, suffixStart), reported, StringComparison.Ordinal))
+            return "suffix_unavailable";
+        return "different";
+    }
+
+    private static int DiagnoseLoginConfiguration()
+    {
+        RequireAdministrator();
+        Credentials credentials = LoadCredentials();
+        string username = GetLoginUsername(credentials);
+        Dictionary<string, object> status = GetUserInfo();
+        Console.WriteLine("Diagnostic check only; no login request was submitted.");
+        if (IsOnline(status))
+        {
+            string comparison = CompareAccountWithSession(credentials, status);
+            if (comparison == "unavailable")
+                Console.WriteLine("The portal did not provide an account name; comparison is unavailable.");
+            else if (comparison == "match")
+                Console.WriteLine("Saved account matches the current web session.");
+            else if (comparison == "suffix_unavailable")
+                Console.WriteLine("Saved account name matches the web session; the portal response cannot verify its login suffix.");
+            else
+                Console.WriteLine("Saved account differs from the current web session. Check the account and optional suffix.");
+            Console.WriteLine("Saved password cannot be verified while the session is online.");
+        }
+        else
+            Console.WriteLine("The session is offline; saved account comparison is unavailable.");
+
+        try
+        {
+            Dictionary<string, object> record = GetPortalLoginRecord(credentials.Username);
+            string detail = GetSafePortalDetail(record, credentials, username, GetAddress(status), null);
+            Console.WriteLine("Last recorded portal detail (may be historical): " +
+                (String.IsNullOrEmpty(detail) ? "No detailed reason available." : detail));
+        }
+        catch (Exception)
+        {
+            Console.WriteLine("The portal diagnostic record is unavailable.");
+        }
+        return 0;
+    }
+
+    private static Dictionary<string, object> GetPortalLoginRecord(string username)
+    {
+        string body = HttpGet(new Uri(PortalBase + "v1/srun_portal_log?username=" + Uri.EscapeDataString(username)));
+        return Json.Deserialize<Dictionary<string, object>>(body);
+    }
+
+    private static string GetSafePortalDetail(
+        IDictionary<string, object> response, Credentials credentials, string username,
+        string clientIp, IDictionary<string, string> login)
+    {
+        string code = SafeServerCode(GetString(response, "ecode"));
+        string message = GetString(response, "error_msg");
+        string policy = GetString(response, "ploy_msg");
+        if (!String.IsNullOrEmpty(policy) && !policy.StartsWith("E0000", StringComparison.Ordinal))
+            message = policy;
+        if (String.IsNullOrEmpty(message))
+            message = GetString(response, "message");
+        var sensitive = new List<string> { credentials.Password, username, credentials.Username, clientIp };
+        if (login != null)
+        {
+            foreach (string field in new[] { "password", "info", "chksum" })
+                if (login.ContainsKey(field)) sensitive.Add(login[field]);
+        }
+        foreach (string value in sensitive)
+        {
+            if (String.IsNullOrEmpty(value)) continue;
+            message = message.Replace(value, "[redacted]");
+            message = message.Replace(Uri.EscapeDataString(value), "[redacted]");
+        }
+        message = Regex.Replace(message, @"(?:\d{1,3}\.){3}\d{1,3}", "[address]");
+        message = Regex.Replace(message, @"(?i)\b[0-9a-f]{32,}\b", "[redacted]");
+        message = Regex.Replace(message, @"[\p{Cc}\p{Cf}]+", " ").Trim();
+        if (message.Length > 240) message = message.Substring(0, 240);
+        string result = code == "unknown" ? "" : "ecode=" + code;
+        if (!String.IsNullOrEmpty(message)) result += (result.Length == 0 ? "" : "; ") + "message=" + message;
+        return result;
+    }
+
     private static bool CheckAndAuthenticate(bool showStatus)
     {
         Dictionary<string, object> status = GetUserInfo();
@@ -292,9 +407,7 @@ internal static class CampusSrunGuardian
         string clientIp = GetAddress(status);
         if (String.IsNullOrEmpty(clientIp))
             throw new InvalidDataException("SRun status did not include a client IP; refusing to guess from the system route.");
-        string username = credentials.Username;
-        if (!String.IsNullOrEmpty(credentials.UserType))
-            username += "@" + credentials.UserType;
+        string username = GetLoginUsername(credentials);
 
         Dictionary<string, object> challengeResponse = GetChallenge(username, clientIp);
         string token = GetString(challengeResponse, "challenge");
@@ -314,6 +427,27 @@ internal static class CampusSrunGuardian
             Log("login", "Portal rejected login: " + safeCode);
             if (showStatus)
                 Console.WriteLine("SRun rejected the login: " + safeCode);
+            string detail = GetSafePortalDetail(response, credentials, username, clientIp, login);
+            if (!String.IsNullOrEmpty(detail))
+            {
+                Log("login-detail", "Portal failure detail: " + detail);
+                if (showStatus) Console.WriteLine("Portal failure detail: " + detail);
+            }
+            string errorMessage = GetString(response, "error_msg");
+            if (String.IsNullOrEmpty(detail) || errorMessage == "not_online_error" ||
+                errorMessage == "no_response_data_error" || errorMessage == "RD000")
+            {
+                try
+                {
+                    detail = GetSafePortalDetail(GetPortalLoginRecord(credentials.Username), credentials, username, clientIp, login);
+                    if (!String.IsNullOrEmpty(detail))
+                    {
+                        Log("login-detail", "Last recorded portal detail (may be historical): " + detail);
+                        if (showStatus) Console.WriteLine("Last recorded portal detail (may be historical): " + detail);
+                    }
+                }
+                catch (Exception) { }
+            }
             return false;
         }
 
@@ -420,7 +554,7 @@ internal static class CampusSrunGuardian
         request.AllowAutoRedirect = false;
         request.Timeout = HttpTimeoutMs;
         request.ReadWriteTimeout = HttpTimeoutMs;
-        request.UserAgent = "CampusSrunGuardian/0.1";
+        request.UserAgent = "CampusSrunGuardian/" + AppMetadata.Version;
         request.Accept = "*/*";
         using (var response = (HttpWebResponse)request.GetResponse())
         {

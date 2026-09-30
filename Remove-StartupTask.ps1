@@ -1,4 +1,5 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
+param([int]$WaitForProcessId = 0)
 $ErrorActionPreference = 'Stop'
 $taskName = 'CampusSrunGuardian'
 
@@ -9,6 +10,10 @@ if ($task) {
     Write-Host "Removed the $taskName boot task."
 } else {
     Write-Host "The $taskName boot task is not registered."
+}
+
+if ($WaitForProcessId -gt 0) {
+    Wait-Process -Id $WaitForProcessId -Timeout 60 -ErrorAction SilentlyContinue
 }
 
 $programFilesPath = [IO.Path]::GetFullPath([Environment]::GetEnvironmentVariable('ProgramFiles')).TrimEnd('\')
@@ -23,6 +28,13 @@ if (Test-Path -LiteralPath $installDirectory) {
     }
     Remove-Item -LiteralPath $resolvedInstallDirectory -Recurse -Force
     Write-Host 'Removed the installed program files. Credentials and logs were retained.'
+}
+
+$startMenuDirectory = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'
+$shortcutPath = Join-Path $startMenuDirectory '校园网自动认证.lnk'
+if (Test-Path -LiteralPath $shortcutPath) {
+    Remove-Item -LiteralPath $shortcutPath -Force
+    Write-Host 'Removed the Start menu shortcut.'
 }
 
 $ssidPath = Join-Path $env:ProgramData 'CampusSrunGuardian\campus-ssid.txt'

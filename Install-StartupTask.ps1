@@ -1,10 +1,18 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 $ErrorActionPreference = 'Stop'
 
 $taskName = 'CampusSrunGuardian'
 $taskPath = '\'
 $localServiceSid = 'S-1-5-19'
 $builtExecutable = Join-Path $PSScriptRoot 'bin\CampusSrunGuardian.exe'
+$builtControlPanelLauncher = Join-Path $PSScriptRoot 'CampusSrunGuardianControlPanel.exe'
+$controlPanelSource = Join-Path $PSScriptRoot 'ControlPanel.ps1'
+$installDirectory = Join-Path $env:ProgramFiles 'CampusSrunGuardian'
+$controlPanelLauncher = Join-Path $installDirectory 'CampusSrunGuardianControlPanel.exe'
+$isInstalledLauncherSource = [String]::Equals(
+    [IO.Path]::GetFullPath($builtControlPanelLauncher),
+    [IO.Path]::GetFullPath($controlPanelLauncher),
+    [StringComparison]::OrdinalIgnoreCase)
 
 function ConvertTo-TaskLogonTypeValue {
     param([Parameter(Mandatory = $true)][string]$LogonType)
@@ -46,6 +54,23 @@ function Register-TaskXml {
 if (-not (Test-Path -LiteralPath $builtExecutable)) {
     throw 'Run Build.ps1 first.'
 }
+foreach ($requiredFile in @($builtControlPanelLauncher, $controlPanelSource)) {
+    if (-not (Test-Path -LiteralPath $requiredFile)) {
+        throw "Required control-panel file is missing: $requiredFile"
+    }
+}
+foreach ($requiredFile in @(
+    (Join-Path $PSScriptRoot 'README.md'),
+    (Join-Path $PSScriptRoot 'VERSION'),
+    (Join-Path $PSScriptRoot 'CHANGELOG.md'),
+    (Join-Path $PSScriptRoot 'Install-StartupTask.ps1'),
+    (Join-Path $PSScriptRoot 'Remove-StartupTask.ps1'),
+    (Join-Path $PSScriptRoot 'Invoke-CampusSrunOnce.ps1')
+)) {
+    if (-not (Test-Path -LiteralPath $requiredFile)) {
+        throw "Required support file is missing: $requiredFile"
+    }
+}
 
 # Confirm that this is the configured campus portal before capturing the
 # currently connected Wi-Fi SSID or replacing the old task.
@@ -68,15 +93,28 @@ if ($campusSsids.Count -eq 0) {
     throw 'No connected Wi-Fi SSID was detected. The existing startup task was left unchanged.'
 }
 
-$installDirectory = Join-Path $env:ProgramFiles 'CampusSrunGuardian'
+$installedBinDirectory = Join-Path $installDirectory 'bin'
 $executable = Join-Path $installDirectory 'CampusSrunGuardian.exe'
+$installedBuildExecutable = Join-Path $installedBinDirectory 'CampusSrunGuardian.exe'
+$controlPanel = Join-Path $installDirectory 'ControlPanel.ps1'
+$installScript = Join-Path $installDirectory 'Install-StartupTask.ps1'
+$removeScript = Join-Path $installDirectory 'Remove-StartupTask.ps1'
+$readme = Join-Path $installDirectory 'README.md'
+$versionFile = Join-Path $installDirectory 'VERSION'
+$changeLogFile = Join-Path $installDirectory 'CHANGELOG.md'
 $wrapper = Join-Path $installDirectory 'Invoke-CampusSrunOnce.ps1'
 $dataDirectory = Join-Path $env:ProgramData 'CampusSrunGuardian'
 $ssidPath = Join-Path $dataDirectory 'campus-ssid.txt'
 New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
+New-Item -ItemType Directory -Path $installedBinDirectory -Force | Out-Null
 New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
 
 $wrapperSource = Join-Path $PSScriptRoot 'Invoke-CampusSrunOnce.ps1'
+$installScriptSource = Join-Path $PSScriptRoot 'Install-StartupTask.ps1'
+$removeScriptSource = Join-Path $PSScriptRoot 'Remove-StartupTask.ps1'
+$readmeSource = Join-Path $PSScriptRoot 'README.md'
+$versionSource = Join-Path $PSScriptRoot 'VERSION'
+$changeLogSource = Join-Path $PSScriptRoot 'CHANGELOG.md'
 if (-not (Test-Path -LiteralPath $wrapperSource)) {
     throw 'Invoke-CampusSrunOnce.ps1 is missing.'
 }
@@ -160,8 +198,26 @@ $ssidAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
 Set-Acl -LiteralPath $ssidStagingPath -AclObject $ssidAcl
 
 $executableStagingPath = $executable + '.new'
+$installedBuildExecutableStagingPath = $installedBuildExecutable + '.new'
+$controlPanelLauncherStagingPath = $controlPanelLauncher + '.new'
+$controlPanelStagingPath = $controlPanel + '.new'
+$installScriptStagingPath = $installScript + '.new'
+$removeScriptStagingPath = $removeScript + '.new'
+$readmeStagingPath = $readme + '.new'
+$versionStagingPath = $versionFile + '.new'
+$changeLogStagingPath = $changeLogFile + '.new'
 $wrapperStagingPath = $wrapper + '.new'
 Copy-Item -LiteralPath $builtExecutable -Destination $executableStagingPath -Force
+Copy-Item -LiteralPath $builtExecutable -Destination $installedBuildExecutableStagingPath -Force
+if (-not $isInstalledLauncherSource) {
+    Copy-Item -LiteralPath $builtControlPanelLauncher -Destination $controlPanelLauncherStagingPath -Force
+}
+Copy-Item -LiteralPath $controlPanelSource -Destination $controlPanelStagingPath -Force
+Copy-Item -LiteralPath $installScriptSource -Destination $installScriptStagingPath -Force
+Copy-Item -LiteralPath $removeScriptSource -Destination $removeScriptStagingPath -Force
+Copy-Item -LiteralPath $readmeSource -Destination $readmeStagingPath -Force
+Copy-Item -LiteralPath $versionSource -Destination $versionStagingPath -Force
+Copy-Item -LiteralPath $changeLogSource -Destination $changeLogStagingPath -Force
 Copy-Item -LiteralPath $wrapperSource -Destination $wrapperStagingPath -Force
 
 $oldTaskXml = $null
@@ -182,6 +238,16 @@ if ($oldTask) {
 
 try {
     Move-Item -LiteralPath $executableStagingPath -Destination $executable -Force
+    Move-Item -LiteralPath $installedBuildExecutableStagingPath -Destination $installedBuildExecutable -Force
+    if (-not $isInstalledLauncherSource) {
+        Move-Item -LiteralPath $controlPanelLauncherStagingPath -Destination $controlPanelLauncher -Force
+    }
+    Move-Item -LiteralPath $controlPanelStagingPath -Destination $controlPanel -Force
+    Move-Item -LiteralPath $installScriptStagingPath -Destination $installScript -Force
+    Move-Item -LiteralPath $removeScriptStagingPath -Destination $removeScript -Force
+    Move-Item -LiteralPath $readmeStagingPath -Destination $readme -Force
+    Move-Item -LiteralPath $versionStagingPath -Destination $versionFile -Force
+    Move-Item -LiteralPath $changeLogStagingPath -Destination $changeLogFile -Force
     Move-Item -LiteralPath $wrapperStagingPath -Destination $wrapper -Force
     Move-Item -LiteralPath $ssidStagingPath -Destination $ssidPath -Force
     Register-TaskXml -Name $taskName -Path $taskPath -DefinitionXml $xml -UserId $localServiceSid -LogonType 5
@@ -201,10 +267,30 @@ try {
     }
     throw
 } finally {
-    Remove-Item -LiteralPath $executableStagingPath, $wrapperStagingPath, $ssidStagingPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $executableStagingPath, $installedBuildExecutableStagingPath, $controlPanelLauncherStagingPath, $controlPanelStagingPath, $installScriptStagingPath, $removeScriptStagingPath, $readmeStagingPath, $versionStagingPath, $changeLogStagingPath, $wrapperStagingPath, $ssidStagingPath -Force -ErrorAction SilentlyContinue
+}
+
+$shortcutCreated = $false
+$startMenuDirectory = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'
+$shortcutPath = Join-Path $startMenuDirectory '校园网自动认证.lnk'
+try {
+    New-Item -ItemType Directory -Path $startMenuDirectory -Force | Out-Null
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $controlPanelLauncher
+    $shortcut.WorkingDirectory = $installDirectory
+    $shortcut.Description = '查看校园网状态、管理自动检查和账号设置'
+    $shortcut.Save()
+    $shortcutCreated = $true
+} catch {
+    Write-Warning "The program was installed, but the Start menu shortcut could not be created: $($_.Exception.Message)"
 }
 
 Write-Host "Installed the executable under $installDirectory."
+Write-Host "Installed the graphical control panel under $installDirectory."
+if ($shortcutCreated) {
+    Write-Host 'Added Campus SRun Guardian to the Start menu.'
+}
 Write-Host "Captured the currently connected Wi-Fi SSID for the local-only guard."
 Write-Host "Registered and verified $taskPath$taskName as LocalService with network-event triggers and a five-minute one-shot fallback."
 Write-Host 'The executable exits after each check; this script does not start the task now.'
